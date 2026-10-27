@@ -224,6 +224,21 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ] as const;
       }).pipe(Effect.flatten);
 
+    if (options.terminationError !== undefined) {
+      yield* options.terminationError.pipe(
+        Effect.flatMap((error) =>
+          Deferred.await(terminationSignal).pipe(
+            Effect.timeoutOrElse({
+              duration: EXIT_STATUS_GRACE,
+              orElse: () => handleTermination(() => Effect.succeed(error)),
+            }),
+          ),
+        ),
+        Effect.forkIn(protocolScope, { startImmediately: true }),
+        Effect.asVoid,
+      );
+    }
+
     const offerOutgoing =
       /* Every protocol write reaches this helper; request spans cover the operation. */
       Effect.fnUntraced(function* (message: Record<string, unknown>) {
