@@ -22,6 +22,46 @@ const encodeJsonl = (value: unknown) => encoder.encode(`${encodeUnknownJsonStrin
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
+  it.effect("drains received notifications before publishing process termination", () =>
+    Effect.gen(function* () {
+      const { stdio, input, output } = yield* makeInMemoryStdio();
+      const exit = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        terminationError: Deferred.await(exit),
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+        onNotification: (notification) =>
+          notification.method === "first"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Deferred.succeed(completed, undefined).pipe(Effect.asVoid),
+      });
+      const request = yield* transport
+        .request("account/read", {})
+        .pipe(
+          Effect.match({ onFailure: (error) => error._tag, onSuccess: () => "unexpected-success" }),
+          Effect.forkScoped,
+        );
+      yield* Queue.take(output);
+      yield* Queue.offer(
+        input,
+        encoder.encode('{"method":"first","params":{}}\n{"method":"turn/completed","params":{}}\n'),
+      );
+      yield* Deferred.await(entered);
+      yield* Deferred.succeed(exit, new CodexError.CodexAppServerProcessExitedError({ code: 7 }));
+      yield* TestClock.adjust("300 millis");
+      const error = yield* Fiber.join(request);
+      assert.equal(error, "CodexAppServerProcessExitedError");
+      assert.isFalse(yield* Deferred.isDone(terminated));
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(completed);
+      yield* Deferred.await(terminated);
+    }),
+  );
+
   it.effect(
     "encodes requests without a jsonrpc field and routes inbound requests and notifications",
     () =>

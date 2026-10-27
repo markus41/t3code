@@ -175,6 +175,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
+    const inputReaderFinished = yield* Deferred.make<void>();
     const activeRequestHandlers = yield* Ref.make(0);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -217,7 +218,11 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
               Effect.asVoid,
             );
             if (options.onTermination) {
-              yield* options.onTermination(error);
+              yield* Deferred.await(inputReaderFinished).pipe(
+                Effect.andThen(options.onTermination(error)),
+                Effect.forkIn(protocolScope),
+                Effect.asVoid,
+              );
             }
           }),
           true,
@@ -374,7 +379,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       );
 
     const routeMessage = Effect.fnUntraced(function* (message: unknown) {
-      if (Option.isSome(yield* Ref.get(terminationFailure))) return;
+      const termination = yield* Ref.get(terminationFailure);
+      if (
+        Option.isSome(termination) &&
+        (termination.value._tag !== "CodexAppServerProcessExitedError" ||
+          !isIncomingNotification(message))
+      )
+        return;
       if (isIncomingRequest(message)) return yield* handleRequest(message);
       if (isIncomingNotification(message)) return yield* handleNotification(message);
       if (isIncomingResponse(message)) return yield* handleResponse(message);
@@ -478,6 +489,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             }),
           ),
       }),
+      Effect.ensuring(Deferred.succeed(inputReaderFinished, undefined)),
       Effect.forkScoped,
     );
 

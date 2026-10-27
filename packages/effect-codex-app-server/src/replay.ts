@@ -417,18 +417,8 @@ const makeReplayClientWithState = Effect.fn(
       Effect.andThen(Queue.end(input)),
     );
 
-  const drainInbound = Effect.fn("effect-codex-app-server/replay.drainInbound")(function* () {
-    while (true) {
-      const current = yield* Ref.get(state);
-      if (current.failure) {
-        return;
-      }
-
-      const entry = transcript.entries[current.cursor];
-      if (!entry) {
-        return;
-      }
-
+  const processInboundEntry = Effect.fn("effect-codex-app-server/replay.processInboundEntry")(
+    function* (entry: CodexAppServerReplayEntry, cursor: number) {
       if (entry.type === "emit_inbound") {
         if (driver.beforeEmitInbound !== undefined) {
           yield* driver.beforeEmitInbound(entry);
@@ -438,31 +428,38 @@ const makeReplayClientWithState = Effect.fn(
         }
         yield* Queue.offer(input, encodeInboundFrame(entry.frame));
         yield* Ref.update(state, (latest) => ({ ...latest, cursor: latest.cursor + 1 }));
-        continue;
+        return true;
       }
+      if (entry.type !== "runtime_exit") return false;
 
-      if (entry.type === "runtime_exit") {
-        yield* Ref.update(state, (latest) => ({ ...latest, cursor: latest.cursor + 1 }));
-        if (entry.status === "success") {
-          yield* Deferred.succeed(
-            terminationError,
-            new CodexError.CodexAppServerProcessExitedError({ code: 0 }),
-          );
-          yield* Queue.end(input);
-          return;
-        }
-        yield* failReplay(
-          new CodexAppServerReplayRuntimeExitError({
-            scenario: transcript.scenario,
-            cursor: current.cursor,
-            status: entry.status,
-            ...(entry.error === undefined ? {} : { error: entry.error }),
-          }),
+      yield* Ref.update(state, (latest) => ({ ...latest, cursor: latest.cursor + 1 }));
+      if (entry.status === "success") {
+        yield* Deferred.succeed(
+          terminationError,
+          new CodexError.CodexAppServerProcessExitedError({ code: 0 }),
         );
-        return;
+        yield* Queue.end(input);
+        return false;
       }
+      yield* failReplay(
+        new CodexAppServerReplayRuntimeExitError({
+          scenario: transcript.scenario,
+          cursor,
+          status: entry.status,
+          ...(entry.error === undefined ? {} : { error: entry.error }),
+        }),
+      );
+      return false;
+    },
+  );
 
-      return;
+  const drainInbound = Effect.fn("effect-codex-app-server/replay.drainInbound")(function* () {
+    while (true) {
+      const current = yield* Ref.get(state);
+      if (current.failure) return;
+      const entry = transcript.entries[current.cursor];
+      if (!entry) return;
+      if (!(yield* processInboundEntry(entry, current.cursor))) return;
     }
   });
 
