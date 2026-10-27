@@ -1735,7 +1735,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               new ProviderAdapter.ProviderAdapterEventStreamError({
                 driver: CODEX_PROVIDER,
                 providerSessionId: input.providerSessionId,
-                cause,
+                cause: cause._tag,
               }),
             ),
           ),

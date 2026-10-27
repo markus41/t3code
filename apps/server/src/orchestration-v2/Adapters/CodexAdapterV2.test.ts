@@ -769,6 +769,36 @@ describe("CodexAdapterV2 session initialize", () => {
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
 
+  it.effect("redacts nested process diagnostics from adapter event failures", () =>
+    Effect.gen(function* () {
+      const secret = "synthetic-private-sentinel-123";
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
+          scenario: "initialize-redacted-exit",
+          entries: [
+            ...replayPreamble("initialize-redacted-exit").slice(0, 1),
+            { type: "runtime_exit", status: "error", error: secret },
+          ],
+        }),
+      );
+      const failureFiber = yield* session.events.pipe(
+        Stream.runDrain,
+        Effect.flip,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      yield* session.ensureThread("thread-initialize-redacted-exit").pipe(Effect.ignore);
+      const failure = yield* Fiber.join(failureFiber).pipe(Effect.timeout("5 seconds"));
+      assert.equal(failure._tag, "ProviderAdapterEventStreamError");
+      assert.equal(failure.cause, "CodexAppServerTransportError");
+      assert.notInclude(JSON.stringify(failure), secret);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
+
   it.effect("fails the adapter event stream when the app server exits during initialize", () =>
     Effect.gen(function* () {
       const session = yield* openReplaySession(
