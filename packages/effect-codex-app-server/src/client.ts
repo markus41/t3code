@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -17,7 +18,7 @@ import {
   encodeOptionalPayload,
   runHandler,
 } from "./_internal/shared.ts";
-import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+import { makeChildStdio, makeStderrClassifier, makeTerminationError } from "./_internal/stdio.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -40,6 +41,7 @@ export class CodexAppServerClient extends Context.Service<
   CodexAppServerClient,
   {
     readonly raw: CodexAppServerClientRaw;
+    readonly termination: Effect.Effect<CodexError.CodexAppServerError>;
     readonly request: <M extends CodexRpc.ClientRequestMethod>(
       method: M,
       payload: CodexRpc.ClientRequestParamsByMethod[M],
@@ -99,6 +101,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
   options: CodexAppServerClientOptions = {},
   terminationError?: Effect.Effect<CodexError.CodexAppServerError>,
 ): Effect.fn.Return<CodexAppServerClient["Service"], never, Scope.Scope> {
+  const terminated = yield* Deferred.make<CodexError.CodexAppServerError>();
   const requestHandlers = new Map<string, ServerRequestHandler>();
   const notificationHandlers = new Map<string, Array<ServerNotificationHandler>>();
   let unknownRequestHandler:
@@ -203,6 +206,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     ...(options.logger ? { logger: options.logger } : {}),
     onNotification: dispatchNotification,
     onRequest: dispatchRequest,
+    onTermination: (error) => Deferred.succeed(terminated, error).pipe(Effect.asVoid),
   });
 
   const request = <M extends CodexRpc.ClientRequestMethod>(
@@ -230,6 +234,7 @@ export const make = Effect.fn("effect-codex-app-server/CodexAppServerClient.make
     );
 
   return CodexAppServerClient.of({
+    termination: Deferred.await(terminated),
     raw: {
       notifications: transport.incomingNotifications,
       requests: transport.incomingRequests,
@@ -282,6 +287,16 @@ export const layerChildProcess = (
 const makeChildProcessClient = Effect.fn(
   "effect-codex-app-server/CodexAppServerClient.makeChildProcessClient",
 )(function* (handle: ChildProcessSpawner.ChildProcessHandle, options: CodexAppServerClientOptions) {
-  yield* Stream.runDrain(handle.stderr).pipe(Effect.ignore, Effect.forkScoped);
-  return yield* make(makeChildStdio(handle), options, makeTerminationError(handle));
+  const stderr = makeStderrClassifier();
+  // Do not await EOF: descendants can inherit stderr after the app-server exits.
+  yield* Stream.runForEach(handle.stderr, (chunk) => Effect.sync(() => stderr.observe(chunk))).pipe(
+    Effect.tap(() => Effect.sync(stderr.finish)),
+    Effect.ignore,
+    Effect.forkScoped,
+  );
+  return yield* make(
+    makeChildStdio(handle),
+    options,
+    makeTerminationError(handle, stderr.result, stderr.isComplete),
+  );
 });

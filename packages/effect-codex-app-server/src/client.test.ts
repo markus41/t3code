@@ -2,12 +2,15 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, it, live } from "@effect/vitest";
 
 import * as CodexClient from "./client.ts";
 
@@ -28,6 +31,82 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       });
       return yield* spawner.spawn(command);
     });
+
+  live("records a real child exit without awaiting stderr EOF or emitting its content", () => {
+    const spans: Array<{ name: string; attributes: Record<string, unknown> }> = [];
+    const tracer = Tracer.make({
+      span: (options) => {
+        const span = new Tracer.NativeSpan(options);
+        const end = span.end.bind(span);
+        span.end = (time, exit) => {
+          end(time, exit);
+          spans.push({ name: span.name, attributes: Object.fromEntries(span.attributes) });
+        };
+        return span;
+      },
+    });
+    return Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, [
+          "-e",
+          "process.stdin.once('data', () => process.stderr.write('unauthorized private-token-123', () => process.exit(7)))",
+        ]),
+      );
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(
+        CodexClient.layerChildProcess({
+          ...handle,
+          stderr: Stream.concat(handle.stderr, Stream.never),
+        }),
+        scope,
+      );
+      yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        const error = yield* client.request("account/read", {}).pipe(Effect.flip);
+        assert.equal(error._tag, "CodexAppServerProcessExitedError");
+        const termination = yield* client.termination;
+        assert.strictEqual(termination, error);
+      }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
+      const exitSpans = spans.filter((item) => item.name === "CodexAppServer.childExit");
+      assert.lengthOf(exitSpans, 1);
+      const span = exitSpans[0];
+      assert.equal(span?.attributes["codex.child.pid"], handle.pid);
+      assert.equal(span?.attributes["codex.child.exit_code"], 7);
+      assert.include(["none", "authentication"], span?.attributes["codex.child.stderr_class"]);
+      assert.equal(span?.attributes["codex.child.stderr_complete"], false);
+      assert.equal(span?.attributes["codex.child.exit_signal"], "unavailable");
+      assert.notInclude(JSON.stringify(spans), "private-token-123");
+    }).pipe(Effect.withTracer(tracer), Effect.provide(NodeServices.layer));
+  });
+
+  live("rejects a pending request when the child exits before stdout closes", () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, [
+          "-e",
+          "process.stdin.once('data', () => process.exit(7));",
+        ]),
+      );
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(
+        CodexClient.layerChildProcess({
+          ...handle,
+          stdout: Stream.concat(handle.stdout, Stream.never),
+        }),
+        scope,
+      );
+
+      yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        const pending = yield* client.request("account/read", {}).pipe(Effect.forkChild);
+        const error = yield* Fiber.join(pending).pipe(Effect.flip);
+        assert.equal(error._tag, "CodexAppServerProcessExitedError");
+        assert.strictEqual(yield* client.termination, error);
+      }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   it.effect("initializes, handles typed server requests, and reads account and skills data", () =>
     Effect.gen(function* () {

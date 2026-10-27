@@ -161,12 +161,19 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     options: CodexAppServerPatchedProtocolOptions,
   ): Effect.fn.Return<CodexAppServerPatchedProtocol, never, Scope.Scope> {
     const protocolScope = yield* Scope.Scope;
+    const terminationError =
+      options.terminationError === undefined
+        ? undefined
+        : yield* Effect.cached(options.terminationError);
     const requestHandlerScope = yield* Scope.fork(protocolScope, "parallel");
     const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
-    const incomingNotifications =
-      yield* Queue.sliding<CodexAppServerIncomingNotification>(MAX_BUFFERED_RAW_MESSAGES);
-    const incomingRequests =
-      yield* Queue.sliding<CodexAppServerIncomingRequest>(MAX_BUFFERED_RAW_MESSAGES);
+    const incomingNotifications = yield* Queue.sliding<
+      CodexAppServerIncomingNotification,
+      Cause.Done
+    >(MAX_BUFFERED_RAW_MESSAGES);
+    const incomingRequests = yield* Queue.sliding<CodexAppServerIncomingRequest, Cause.Done>(
+      MAX_BUFFERED_RAW_MESSAGES,
+    );
     const pending = yield* Ref.make(new Map<string, CodexAppServerPendingRequest>());
     const nextRequestId = yield* Ref.make(1);
     const maxIncomingMessageBytes = options.maxIncomingMessageBytes ?? MAX_INCOMING_MESSAGE_BYTES;
@@ -174,7 +181,11 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     let remainderBytes = 0;
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
+    const drainingAfterExit = yield* Ref.make(false);
     const terminationSignal = yield* Deferred.make<void>();
+    const stopInputSignal = yield* Deferred.make<void>();
+    const inputReaderFinished = yield* Deferred.make<void>();
+    const terminationReady = yield* Deferred.make<void>();
     const activeRequestHandlers = yield* Ref.make(0);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -200,7 +211,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.andThen(Ref.set(pending, new Map())),
       );
 
-    const handleTermination = (classify: () => Effect.Effect<CodexError.CodexAppServerError>) =>
+    const handleTermination = (
+      classify: () => Effect.Effect<CodexError.CodexAppServerError>,
+      drainOutput = false,
+    ) =>
       Ref.modify(terminationHandled, (handled) => {
         if (handled) {
           return [Effect.void, true] as const;
@@ -208,21 +222,64 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         return [
           Effect.gen(function* () {
             const error = yield* classify();
+            yield* Ref.set(drainingAfterExit, drainOutput);
             yield* Ref.set(terminationFailure, Option.some(error));
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
             yield* Deferred.succeed(terminationSignal, undefined);
+            yield* (
+              drainOutput
+                ? Deferred.await(inputReaderFinished).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "1 second",
+                      orElse: () =>
+                        Effect.logWarning(
+                          "Codex app-server stdout did not close after process exit; stopping the drain. Later output may be lost.",
+                        ).pipe(
+                          Effect.andThen(Ref.set(drainingAfterExit, false)),
+                          Effect.andThen(Deferred.succeed(stopInputSignal, undefined)),
+                          Effect.asVoid,
+                        ),
+                    }),
+                  )
+                : Deferred.succeed(stopInputSignal, undefined).pipe(Effect.asVoid)
+            ).pipe(
+              Effect.andThen(Queue.end(incomingNotifications)),
+              Effect.andThen(Queue.end(incomingRequests)),
+              Effect.andThen(Deferred.succeed(terminationReady, undefined)),
+              Effect.forkIn(protocolScope),
+              Effect.asVoid,
+            );
             yield* Scope.close(requestHandlerScope, Exit.void).pipe(
               Effect.forkIn(protocolScope, { startImmediately: true }),
               Effect.asVoid,
             );
             if (options.onTermination) {
-              yield* options.onTermination(error);
+              yield* Deferred.await(terminationReady).pipe(
+                Effect.andThen(options.onTermination(error)),
+                Effect.forkIn(protocolScope),
+                Effect.asVoid,
+              );
             }
           }),
           true,
         ] as const;
       }).pipe(Effect.flatten);
+
+    if (terminationError !== undefined) {
+      yield* terminationError.pipe(
+        Effect.flatMap((error) =>
+          Deferred.await(terminationSignal).pipe(
+            Effect.timeoutOrElse({
+              duration: EXIT_STATUS_GRACE,
+              orElse: () => handleTermination(() => Effect.succeed(error), true),
+            }),
+          ),
+        ),
+        Effect.forkIn(protocolScope, { startImmediately: true }),
+        Effect.asVoid,
+      );
+    }
 
     const offerOutgoing =
       /* Every protocol write reaches this helper; request spans cover the operation. */
@@ -359,7 +416,12 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       );
 
     const routeMessage = Effect.fnUntraced(function* (message: unknown) {
-      if (Option.isSome(yield* Ref.get(terminationFailure))) return;
+      const termination = yield* Ref.get(terminationFailure);
+      if (
+        Option.isSome(termination) &&
+        (!(yield* Ref.get(drainingAfterExit)) || !isIncomingNotification(message))
+      )
+        return;
       if (isIncomingRequest(message)) return yield* handleRequest(message);
       if (isIncomingNotification(message)) return yield* handleNotification(message);
       if (isIncomingResponse(message)) return yield* handleResponse(message);
@@ -404,7 +466,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     };
 
     yield* options.stdio.stdin.pipe(
-      Stream.interruptWhen(Deferred.await(terminationSignal)),
+      Stream.interruptWhen(Deferred.await(stopInputSignal)),
       Stream.decodeText(),
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {
@@ -451,9 +513,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                   // Node ends stdout before it reports the exit of a crashed process, so
                   // wait briefly for the exit status. stdout can also close while the
                   // process keeps running, so the wait must not hang pending requests.
-                  return options.terminationError === undefined
+                  return terminationError === undefined
                     ? Effect.succeed(ended)
-                    : options.terminationError.pipe(
+                    : terminationError.pipe(
                         Effect.timeoutOrElse({
                           duration: EXIT_STATUS_GRACE,
                           orElse: () => Effect.succeed(ended),
@@ -463,6 +525,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             }),
           ),
       }),
+      Effect.ensuring(Deferred.succeed(inputReaderFinished, undefined)),
       Effect.forkScoped,
     );
 

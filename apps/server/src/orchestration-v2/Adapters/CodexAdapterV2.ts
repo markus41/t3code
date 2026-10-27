@@ -1483,17 +1483,33 @@ export const layerAppServerClientFactory: Layer.Layer<
           env: environment,
           threadId: input.threadId,
         }).pipe(Effect.provideService(AgentScope, agentScope));
+        yield* Effect.annotateCurrentSpan({
+          "codex.child.phase": "spawning",
+          "codex.child.executable_kind": input.settings.binaryPath ? "configured" : "default",
+          "codex.child.executable_version": "unavailable",
+        });
         const handle = yield* spawner.spawn(command).pipe(
           Effect.provideService(Scope.Scope, scope),
+          Effect.tapError((cause) =>
+            Effect.annotateCurrentSpan({
+              "codex.child.phase": "spawn_failed",
+              "codex.child.error_class": "PlatformError",
+              "codex.child.error_reason": cause.reason._tag,
+            }),
+          ),
           Effect.mapError(
             (cause) =>
               new ProviderAdapter.ProviderAdapterOpenSessionError({
                 driver: CODEX_PROVIDER,
                 providerSessionId: input.providerSessionId,
-                cause,
+                cause: `Codex app-server spawn failed: ${cause.reason._tag}`,
               }),
           ),
         );
+        yield* Effect.annotateCurrentSpan({
+          "codex.child.pid": handle.pid,
+          "codex.child.phase": "spawned",
+        });
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
           threadId: input.threadId,
@@ -1717,7 +1733,23 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           model: input.modelSelection.model,
           now,
         });
-        const events = yield* Queue.unbounded<ProviderAdapter.ProviderAdapterV2Event>();
+        const events = yield* Queue.unbounded<
+          ProviderAdapter.ProviderAdapterV2Event,
+          ProviderAdapter.ProviderAdapterEventStreamError
+        >();
+        yield* client.termination.pipe(
+          Effect.flatMap((cause) =>
+            Queue.fail(
+              events,
+              new ProviderAdapter.ProviderAdapterEventStreamError({
+                driver: CODEX_PROVIDER,
+                providerSessionId: input.providerSessionId,
+                cause: cause._tag,
+              }),
+            ),
+          ),
+          Effect.forkScoped,
+        );
         const rateLimitSnapshot = yield* Ref.make<CodexRateLimitSnapshot | undefined>(undefined);
         const limitedTurnItems = yield* Ref.make(
           new Map<ProviderThreadId, Extract<OrchestrationV2TurnItem, { type: "error" }>>(),

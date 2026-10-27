@@ -8,6 +8,7 @@ import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as References from "effect/References";
@@ -137,6 +138,131 @@ describe("truncateTraceAttributes", () => {
 });
 
 describe("observability", () => {
+  it.effect(
+    "redacts Codex lifecycle failure stacks without changing other failures or interruptions",
+    () =>
+      Effect.gen(function* () {
+        const records: Array<EffectTraceRecord> = [];
+        const delegates: Array<Tracer.Span> = [];
+        const tracer = yield* makeLocalFileTracer({
+          filePath: "unused",
+          maxBytes: 1024,
+          maxFiles: 1,
+          batchWindowMs: 10_000,
+          sink: {
+            filePath: "unused",
+            push: (record) => {
+              if (record.type === "effect-span") records.push(record);
+            },
+            flush: Effect.void,
+            close: () => Effect.void,
+          },
+          delegate: Tracer.make({
+            span: (options) => {
+              const span = new Tracer.NativeSpan(options);
+              delegates.push(span);
+              return span;
+            },
+          }),
+        });
+        const lifecycle = Object.assign(new Error("private-message-sentinel"), {
+          _tag: "CodexAppServerProcessExitedError",
+          stack: "file:///private-lifecycle-path-sentinel",
+        });
+        const unrelated = new Error("unrelated-error-marker");
+        const cause = Cause.combine(
+          Cause.combine(Cause.fail(lifecycle), Cause.fail(unrelated)),
+          Cause.interrupt(42),
+        );
+        const observed = yield* Effect.exit(
+          Effect.failCause(cause).pipe(
+            Effect.withSpan("lifecycle-mixed"),
+            Effect.withTracer(tracer),
+          ),
+        );
+        assert.isTrue(
+          Exit.isFailure(observed) &&
+            observed.cause.reasons.some(
+              (reason) => Cause.isFailReason(reason) && reason.error === lifecycle,
+            ),
+        );
+        assert.equal(records[0]?.exit._tag, "Failure");
+        assert.notInclude(JSON.stringify(records), "private-message-sentinel");
+        assert.notInclude(JSON.stringify(records), "private-lifecycle-path-sentinel");
+        assert.include(JSON.stringify(records), "unrelated-error-marker");
+        const delegated = delegates[0]?.status;
+        assert.isTrue(
+          delegated?._tag === "Ended" &&
+            Exit.isFailure(delegated.exit) &&
+            Cause.hasInterrupts(delegated.exit.cause),
+        );
+        if (delegated?._tag === "Ended" && Exit.isFailure(delegated.exit)) {
+          assert.include(Cause.pretty(delegated.exit.cause), "unrelated-error-marker");
+          assert.notInclude(Cause.pretty(delegated.exit.cause), "private-lifecycle-path-sentinel");
+        }
+        const wrappedSpawn = {
+          _tag: "ProviderAdapterOpenSessionError",
+          driver: "codex",
+          cause: {
+            _tag: "ProviderAdapterOpenSessionError",
+            driver: "codex",
+            cause: "Codex app-server spawn failed: NotFound",
+          },
+        };
+        const wrappedExit = {
+          _tag: "ProviderAdapterEnsureThreadError",
+          driver: "codex",
+          cause: lifecycle,
+        };
+        const eventStream = {
+          _tag: "ProviderAdapterEventStreamError",
+          driver: "codex",
+          cause: "CodexAppServerProcessExitedError",
+        };
+        for (const error of [wrappedSpawn, wrappedExit, eventStream]) {
+          const actual = yield* Effect.exit(
+            Effect.fail(error).pipe(
+              Effect.withSpan("lifecycle-wrapped"),
+              Effect.withTracer(tracer),
+            ),
+          );
+          assert.isTrue(
+            Exit.isFailure(actual) && Option.contains(Cause.findErrorOption(actual.cause), error),
+          );
+        }
+        const cancelled = yield* Effect.exit(
+          Effect.interrupt.pipe(Effect.withSpan("lifecycle-cancel"), Effect.withTracer(tracer)),
+        );
+        assert.isTrue(Exit.isFailure(cancelled) && Cause.hasInterruptsOnly(cancelled.cause));
+        assert.equal(records.at(-1)?.exit._tag, "Interrupted");
+        assert.notInclude(JSON.stringify(records), "private-message-sentinel");
+        assert.notInclude(JSON.stringify(records), "Codex app-server spawn failed: NotFound");
+
+        const unrelatedProvider = Object.assign(new Error("unrelated-provider-marker"), {
+          _tag: "ProviderAdapterEventStreamError",
+          driver: "codex",
+          cause: "unrelated-transport-error",
+        });
+        const cycle: { _tag: string; driver: string; cause?: unknown } = {
+          _tag: "ProviderAdapterOpenSessionError",
+          driver: "codex",
+        };
+        cycle.cause = cycle;
+        for (const error of [unrelatedProvider, cycle]) {
+          const actual = yield* Effect.exit(
+            Effect.fail(error).pipe(
+              Effect.withSpan("unrelated-provider"),
+              Effect.withTracer(tracer),
+            ),
+          );
+          assert.isTrue(
+            Exit.isFailure(actual) && Option.contains(Cause.findErrorOption(actual.cause), error),
+          );
+        }
+        assert.include(JSON.stringify(records), "unrelated-provider-marker");
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect(
     "preserves successful results without retaining them in sampled or unsampled spans",
     () =>
