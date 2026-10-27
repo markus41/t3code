@@ -1483,23 +1483,32 @@ export const layerAppServerClientFactory: Layer.Layer<
           env: environment,
           threadId: input.threadId,
         }).pipe(Effect.provideService(AgentScope, agentScope));
+        yield* Effect.annotateCurrentSpan({
+          "codex.child.phase": "spawning",
+          "codex.child.executable_kind": input.settings.binaryPath ? "configured" : "default",
+          "codex.child.executable_version": "unavailable",
+        });
         const handle = yield* spawner.spawn(command).pipe(
           Effect.provideService(Scope.Scope, scope),
+          Effect.tapError((cause) =>
+            Effect.annotateCurrentSpan({
+              "codex.child.phase": "spawn_failed",
+              "codex.child.error_class": "PlatformError",
+              "codex.child.error_reason": cause.reason._tag,
+            }),
+          ),
           Effect.mapError(
             (cause) =>
               new ProviderAdapter.ProviderAdapterOpenSessionError({
                 driver: CODEX_PROVIDER,
                 providerSessionId: input.providerSessionId,
-                cause,
+                cause: `Codex app-server spawn failed: ${cause.reason._tag}`,
               }),
           ),
         );
         yield* Effect.annotateCurrentSpan({
           "codex.child.pid": handle.pid,
           "codex.child.phase": "spawned",
-          "codex.child.executable_kind": input.settings.binaryPath ? "configured" : "default",
-          // Neither the handle nor initialize's opaque userAgent identifies the binary version.
-          "codex.child.executable_version": "unavailable",
         });
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,

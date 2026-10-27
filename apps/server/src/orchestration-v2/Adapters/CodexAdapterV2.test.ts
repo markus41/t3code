@@ -33,9 +33,11 @@ import * as CodexClient from "effect-codex-app-server/client";
 import * as CodexReplay from "effect-codex-app-server/replay";
 import type * as CodexSchema from "effect-codex-app-server/schema";
 import * as DateTime from "effect/DateTime";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Predicate from "effect/Predicate";
 import * as FileSystem from "effect/FileSystem";
 import { MCP_APP_OUTPUT_KEY, readMcpAppReference } from "@t3tools/shared/mcpApp";
@@ -47,6 +49,7 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import { TestClock } from "effect/testing";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
@@ -470,6 +473,61 @@ const CODEX_TEST_RUNTIME_POLICY = ProviderAdapter.ProviderAdapterV2RuntimePolicy
   runtimeMode: "full-access",
   interactionMode: "default",
   cwd: "/workspace",
+});
+
+it.effect("classifies a failed Codex spawn without exposing its configured path", () => {
+  const spans: Array<{ name: string; attributes: Record<string, unknown>; cause: string }> = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const end = span.end.bind(span);
+      span.end = (time, exit) => {
+        end(time, exit);
+        spans.push({
+          name: span.name,
+          attributes: Object.fromEntries(span.attributes),
+          cause: Exit.isFailure(exit) ? Cause.pretty(exit.cause) : "",
+        });
+      };
+      return span;
+    },
+  });
+  return Effect.gen(function* () {
+    const context = yield* Layer.build(CodexAdapterV2.layerAppServerClientFactory);
+    const factory = yield* Effect.service(CodexAdapterV2.CodexAppServerClientFactory).pipe(
+      Effect.provide(context),
+    );
+    const failure = yield* factory
+      .open({
+        instanceId: CodexAdapterV2.CODEX_DEFAULT_INSTANCE_ID,
+        threadId: ThreadId.make("thread-spawn-failure"),
+        providerSessionId: ProviderSessionId.make("provider-session-spawn-failure"),
+        runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+        settings: { ...DEFAULT_CODEX_SETTINGS, binaryPath: "nonexistent-codex-private-sentinel" },
+        environment: {},
+      })
+      .pipe(Effect.flip);
+    assert.equal(failure._tag, "ProviderAdapterOpenSessionError");
+    assert.equal(failure.cause, "Codex app-server spawn failed: NotFound");
+    const span = spans.find((item) => item.name === "CodexAdapterV2.open");
+    assert.equal(span?.attributes["codex.child.phase"], "spawn_failed");
+    assert.equal(span?.attributes["codex.child.executable_kind"], "configured");
+    assert.equal(span?.attributes["codex.child.error_class"], "PlatformError");
+    assert.equal(span?.attributes["codex.child.error_reason"], "NotFound");
+    assert.notInclude(JSON.stringify(spans), "private-sentinel");
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(
+      Layer.mergeAll(
+        NodeServices.layer,
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    ),
+    Effect.withTracer(tracer),
+  );
 });
 
 function makeCodexTestAppThread(input: {
