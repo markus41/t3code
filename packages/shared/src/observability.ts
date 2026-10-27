@@ -155,6 +155,62 @@ export function causeErrorTag(cause: Cause.Cause<unknown>): string {
   return cause.reasons[0]?._tag ?? "Empty";
 }
 
+function lifecycleTraceTag(error: unknown, depth = 0): string | undefined {
+  try {
+    if (depth > 4 || typeof error !== "object" || error === null || !("_tag" in error)) return;
+    if (
+      error._tag === "CodexAppServerProcessExitedError" ||
+      error._tag === "CodexAppServerInputStreamEndedError"
+    )
+      return error._tag;
+    if (
+      error._tag === "CodexAppServerTransportError" &&
+      "operation" in error &&
+      error.operation === "read-process-exit-status"
+    )
+      return error._tag;
+    if (!("driver" in error) || error.driver !== "codex" || !("cause" in error)) return;
+    if (
+      error._tag === "ProviderAdapterOpenSessionError" &&
+      typeof error.cause === "string" &&
+      /^Codex app-server spawn failed: [A-Za-z]+$/.test(error.cause)
+    )
+      return "CodexAppServerSpawnError";
+    if (
+      error._tag === "ProviderAdapterEventStreamError" &&
+      (error.cause === "CodexAppServerProcessExitedError" ||
+        error.cause === "CodexAppServerInputStreamEndedError" ||
+        error.cause === "CodexAppServerTransportError")
+    )
+      return error.cause;
+    if (
+      error._tag === "ProviderAdapterOpenSessionError" ||
+      error._tag === "ProviderAdapterEnsureThreadError" ||
+      error._tag === "ProviderAdapterTurnStartError"
+    )
+      return lifecycleTraceTag(error.cause, depth + 1);
+  } catch {
+    return;
+  }
+}
+
+function redactLifecycleTraceExit(exit: Exit.Exit<unknown, unknown>): Exit.Exit<unknown, unknown> {
+  if (ExitRuntime.isSuccess(exit)) return ExitRuntime.void;
+  let changed = false;
+  const reasons = exit.cause.reasons.map((reason) => {
+    if (!Cause.isFailReason(reason)) return reason;
+    const tag = lifecycleTraceTag(reason.error);
+    if (!tag) return reason;
+    changed = true;
+    const safe = new Error(tag);
+    safe.name = tag;
+    safe.stack = `${tag}: redacted`;
+    // Fresh reasons discard Effect stack-frame annotations as well as the error stack.
+    return Cause.makeFailReason(safe);
+  });
+  return changed ? ExitRuntime.failCause(Cause.fromReasons(reasons)) : exit;
+}
+
 export interface TraceSinkOptions {
   readonly filePath: string;
   readonly maxBytes: number;
@@ -557,7 +613,7 @@ class LocalFileSpan implements Tracer.Span {
 
   end(endTime: bigint, exit: Exit.Exit<unknown, unknown>): void {
     // Cached lookup fibers retain parent spans. Traces need success status, not result payloads.
-    const traceExit = ExitRuntime.isSuccess(exit) ? ExitRuntime.void : exit;
+    const traceExit = redactLifecycleTraceExit(exit);
     this.status = {
       _tag: "Ended",
       startTime: this.status.startTime,
