@@ -161,6 +161,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     options: CodexAppServerPatchedProtocolOptions,
   ): Effect.fn.Return<CodexAppServerPatchedProtocol, never, Scope.Scope> {
     const protocolScope = yield* Scope.Scope;
+    const terminationError =
+      options.terminationError === undefined
+        ? undefined
+        : yield* Effect.cached(options.terminationError);
     const requestHandlerScope = yield* Scope.fork(protocolScope, "parallel");
     const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
     const incomingNotifications =
@@ -257,8 +261,8 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         ] as const;
       }).pipe(Effect.flatten);
 
-    if (options.terminationError !== undefined) {
-      yield* options.terminationError.pipe(
+    if (terminationError !== undefined) {
+      yield* terminationError.pipe(
         Effect.flatMap((error) =>
           Deferred.await(terminationSignal).pipe(
             Effect.timeoutOrElse({
@@ -504,9 +508,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                   // Node ends stdout before it reports the exit of a crashed process, so
                   // wait briefly for the exit status. stdout can also close while the
                   // process keeps running, so the wait must not hang pending requests.
-                  return options.terminationError === undefined
+                  return terminationError === undefined
                     ? Effect.succeed(ended)
-                    : options.terminationError.pipe(
+                    : terminationError.pipe(
                         Effect.timeoutOrElse({
                           duration: EXIT_STATUS_GRACE,
                           orElse: () => Effect.succeed(ended),

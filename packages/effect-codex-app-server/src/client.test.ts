@@ -68,7 +68,9 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         const termination = yield* client.termination;
         assert.strictEqual(termination, error);
       }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
-      const span = spans.find((item) => item.name === "CodexAppServer.childExit");
+      const exitSpans = spans.filter((item) => item.name === "CodexAppServer.childExit");
+      assert.lengthOf(exitSpans, 1);
+      const span = exitSpans[0];
       assert.equal(span?.attributes["codex.child.pid"], handle.pid);
       assert.equal(span?.attributes["codex.child.exit_code"], 7);
       assert.include(["none", "authentication"], span?.attributes["codex.child.stderr_class"]);
