@@ -1494,6 +1494,13 @@ export const layerAppServerClientFactory: Layer.Layer<
               }),
           ),
         );
+        yield* Effect.annotateCurrentSpan({
+          "codex.child.pid": handle.pid,
+          "codex.child.phase": "spawned",
+          "codex.child.executable_kind": input.settings.binaryPath ? "configured" : "default",
+          // Neither the handle nor initialize's opaque userAgent identifies the binary version.
+          "codex.child.executable_version": "unavailable",
+        });
         const protocolLogger = makeCodexAppServerProtocolLogger({
           nativeEventLogger,
           threadId: input.threadId,

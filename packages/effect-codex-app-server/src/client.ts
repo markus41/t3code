@@ -17,7 +17,7 @@ import {
   encodeOptionalPayload,
   runHandler,
 } from "./_internal/shared.ts";
-import { makeChildStdio, makeTerminationError } from "./_internal/stdio.ts";
+import { makeChildStdio, makeStderrClassifier, makeTerminationError } from "./_internal/stdio.ts";
 
 export interface CodexAppServerClientOptions {
   readonly logIncoming?: boolean;
@@ -282,6 +282,16 @@ export const layerChildProcess = (
 const makeChildProcessClient = Effect.fn(
   "effect-codex-app-server/CodexAppServerClient.makeChildProcessClient",
 )(function* (handle: ChildProcessSpawner.ChildProcessHandle, options: CodexAppServerClientOptions) {
-  yield* Stream.runDrain(handle.stderr).pipe(Effect.ignore, Effect.forkScoped);
-  return yield* make(makeChildStdio(handle), options, makeTerminationError(handle));
+  const stderr = makeStderrClassifier();
+  // Do not await EOF: descendants can inherit stderr after the app-server exits.
+  yield* Stream.runForEach(handle.stderr, (chunk) => Effect.sync(() => stderr.observe(chunk))).pipe(
+    Effect.tap(() => Effect.sync(stderr.finish)),
+    Effect.ignore,
+    Effect.forkScoped,
+  );
+  return yield* make(
+    makeChildStdio(handle),
+    options,
+    makeTerminationError(handle, stderr.result, stderr.isComplete),
+  );
 });
