@@ -174,6 +174,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     let remainderBytes = 0;
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
+    const drainingAfterExit = yield* Ref.make(false);
     const terminationSignal = yield* Deferred.make<void>();
     const stopInputSignal = yield* Deferred.make<void>();
     const inputReaderFinished = yield* Deferred.make<void>();
@@ -203,7 +204,10 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         Effect.andThen(Ref.set(pending, new Map())),
       );
 
-    const handleTermination = (classify: () => Effect.Effect<CodexError.CodexAppServerError>) =>
+    const handleTermination = (
+      classify: () => Effect.Effect<CodexError.CodexAppServerError>,
+      drainOutput = false,
+    ) =>
       Ref.modify(terminationHandled, (handled) => {
         if (handled) {
           return [Effect.void, true] as const;
@@ -211,12 +215,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         return [
           Effect.gen(function* () {
             const error = yield* classify();
+            yield* Ref.set(drainingAfterExit, drainOutput);
             yield* Ref.set(terminationFailure, Option.some(error));
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
             yield* Deferred.succeed(terminationSignal, undefined);
             yield* (
-              error._tag === "CodexAppServerProcessExitedError"
+              drainOutput
                 ? Deferred.await(inputReaderFinished).pipe(
                     Effect.timeoutOrElse({
                       duration: "1 second",
@@ -257,7 +262,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
           Deferred.await(terminationSignal).pipe(
             Effect.timeoutOrElse({
               duration: EXIT_STATUS_GRACE,
-              orElse: () => handleTermination(() => Effect.succeed(error)),
+              orElse: () => handleTermination(() => Effect.succeed(error), true),
             }),
           ),
         ),
@@ -404,8 +409,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
       const termination = yield* Ref.get(terminationFailure);
       if (
         Option.isSome(termination) &&
-        (termination.value._tag !== "CodexAppServerProcessExitedError" ||
-          !isIncomingNotification(message))
+        (!(yield* Ref.get(drainingAfterExit)) || !isIncomingNotification(message))
       )
         return;
       if (isIncomingRequest(message)) return yield* handleRequest(message);
