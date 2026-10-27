@@ -64,6 +64,8 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
         const client = yield* CodexClient.CodexAppServerClient;
         const error = yield* client.request("account/read", {}).pipe(Effect.flip);
         assert.equal(error._tag, "CodexAppServerProcessExitedError");
+        const termination = yield* client.termination;
+        assert.strictEqual(termination, error);
       }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
       const span = spans.find((item) => item.name === "CodexAppServer.childExit");
       assert.equal(span?.attributes["codex.child.pid"], handle.pid);
@@ -74,6 +76,34 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       assert.notInclude(JSON.stringify(spans), "private-token-123");
     }).pipe(Effect.withTracer(tracer), Effect.provide(NodeServices.layer));
   });
+
+  live("rejects a pending request when the child exits before stdout closes", () =>
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(process.execPath, [
+          "-e",
+          "process.stdin.once('data', () => process.exit(7));",
+        ]),
+      );
+      const scope = yield* Scope.make();
+      const context = yield* Layer.buildWithScope(
+        CodexClient.layerChildProcess({
+          ...handle,
+          stdout: Stream.concat(handle.stdout, Stream.never),
+        }),
+        scope,
+      );
+
+      yield* Effect.gen(function* () {
+        const client = yield* CodexClient.CodexAppServerClient;
+        const pending = yield* client.request("account/read", {}).pipe(Effect.forkChild);
+        const error = yield* Fiber.join(pending).pipe(Effect.flip);
+        assert.equal(error._tag, "CodexAppServerProcessExitedError");
+        assert.strictEqual(yield* client.termination, error);
+      }).pipe(Effect.provide(context), Effect.ensuring(Scope.close(scope, Exit.void)));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 
   it.effect("initializes, handles typed server requests, and reads account and skills data", () =>
     Effect.gen(function* () {

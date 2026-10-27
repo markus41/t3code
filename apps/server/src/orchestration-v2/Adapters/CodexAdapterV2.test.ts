@@ -755,6 +755,7 @@ describe("CodexAdapterV2 session initialize", () => {
         runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
       });
       return {
+        events: runtime.events,
         ensureThread: (threadId: string) =>
           runtime.ensureThread({
             threadId: ThreadId.make(threadId),
@@ -767,6 +768,36 @@ describe("CodexAdapterV2 session initialize", () => {
 
   const replayPreamble = (nativeThreadId: string) =>
     codexReplayPreamble({ nativeThreadId, nativeTurnId: "unused", prompt: "unused" });
+
+  it.effect("fails the adapter event stream when the app server exits during initialize", () =>
+    Effect.gen(function* () {
+      const session = yield* openReplaySession(
+        makeCodexReplayTranscript({
+          scenario: "initialize-process-exit",
+          entries: [
+            ...replayPreamble("initialize-process-exit").slice(0, 1),
+            { type: "runtime_exit", status: "success" },
+          ],
+        }),
+      );
+      const eventFailure = yield* session.events.pipe(
+        Stream.runDrain,
+        Effect.flip,
+        Effect.forkChild({ startImmediately: true }),
+      );
+      const requestFailure = yield* session
+        .ensureThread("thread-initialize-process-exit")
+        .pipe(Effect.flip);
+      assert.equal(requestFailure._tag, "ProviderAdapterEnsureThreadError");
+      const failure = yield* Fiber.join(eventFailure).pipe(Effect.timeout("5 seconds"));
+      assert.equal(failure._tag, "ProviderAdapterEventStreamError");
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+      ),
+    ),
+  );
 
   it.effect("sends one initialize when two threads start on a fresh session at once", () =>
     Effect.gen(function* () {
