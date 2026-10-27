@@ -151,6 +151,43 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  it.effect("ends raw inbound streams after child termination", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const exit = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const delivered = yield* Deferred.make<void>();
+      const notifications =
+        yield* Deferred.make<ReadonlyArray<CodexProtocol.CodexAppServerIncomingNotification>>();
+      const requests =
+        yield* Deferred.make<ReadonlyArray<CodexProtocol.CodexAppServerIncomingRequest>>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        terminationError: Deferred.await(exit),
+        onNotification: () => Deferred.succeed(delivered, undefined).pipe(Effect.asVoid),
+      });
+      yield* transport.incomingNotifications.pipe(
+        Stream.runCollect,
+        Effect.flatMap((value) => Deferred.succeed(notifications, value)),
+        Effect.forkScoped,
+      );
+      yield* transport.incomingRequests.pipe(
+        Stream.runCollect,
+        Effect.flatMap((value) => Deferred.succeed(requests, value)),
+        Effect.forkScoped,
+      );
+      yield* Queue.offer(input, encodeJsonl({ method: "test/notification", params: {} }));
+      yield* Deferred.await(delivered);
+      yield* Deferred.succeed(exit, new CodexError.CodexAppServerProcessExitedError({ code: 7 }));
+      yield* TestClock.adjust("2 seconds");
+      assert.isTrue(yield* Deferred.isDone(notifications));
+      assert.isTrue(yield* Deferred.isDone(requests));
+      assert.deepEqual(yield* Deferred.await(notifications), [
+        { method: "test/notification", params: {} },
+      ]);
+      assert.deepEqual(yield* Deferred.await(requests), []);
+    }),
+  );
+
   it.effect(
     "encodes requests without a jsonrpc field and routes inbound requests and notifications",
     () =>

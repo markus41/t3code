@@ -167,10 +167,13 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
         : yield* Effect.cached(options.terminationError);
     const requestHandlerScope = yield* Scope.fork(protocolScope, "parallel");
     const outgoing = yield* Queue.unbounded<string, Cause.Done<void>>();
-    const incomingNotifications =
-      yield* Queue.sliding<CodexAppServerIncomingNotification>(MAX_BUFFERED_RAW_MESSAGES);
-    const incomingRequests =
-      yield* Queue.sliding<CodexAppServerIncomingRequest>(MAX_BUFFERED_RAW_MESSAGES);
+    const incomingNotifications = yield* Queue.sliding<
+      CodexAppServerIncomingNotification,
+      Cause.Done
+    >(MAX_BUFFERED_RAW_MESSAGES);
+    const incomingRequests = yield* Queue.sliding<CodexAppServerIncomingRequest, Cause.Done>(
+      MAX_BUFFERED_RAW_MESSAGES,
+    );
     const pending = yield* Ref.make(new Map<string, CodexAppServerPendingRequest>());
     const nextRequestId = yield* Ref.make(1);
     const maxIncomingMessageBytes = options.maxIncomingMessageBytes ?? MAX_INCOMING_MESSAGE_BYTES;
@@ -241,6 +244,8 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                   )
                 : Deferred.succeed(stopInputSignal, undefined).pipe(Effect.asVoid)
             ).pipe(
+              Effect.andThen(Queue.end(incomingNotifications)),
+              Effect.andThen(Queue.end(incomingRequests)),
               Effect.andThen(Deferred.succeed(terminationReady, undefined)),
               Effect.forkIn(protocolScope),
               Effect.asVoid,
