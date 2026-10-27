@@ -45,6 +45,44 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
     }),
   );
 
+  it.effect("does not dispatch a buffered notification after the drain deadline", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const exit = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const firstDone = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        terminationError: Deferred.await(exit),
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+        onNotification: (notification) =>
+          notification.method === "first"
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(Deferred.succeed(firstDone, undefined)),
+                Effect.asVoid,
+              )
+            : Deferred.succeed(completed, undefined).pipe(Effect.asVoid),
+      });
+      yield* Queue.offer(
+        input,
+        encoder.encode('{"method":"first","params":{}}\n{"method":"turn/completed","params":{}}\n'),
+      );
+      yield* Deferred.await(entered);
+      yield* Deferred.succeed(exit, new CodexError.CodexAppServerProcessExitedError({ code: 7 }));
+      yield* TestClock.adjust("300 millis");
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(terminated);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(firstDone);
+      yield* Effect.yieldNow;
+      assert.isFalse(yield* Deferred.isDone(completed));
+    }),
+  );
+
   it.effect("drains a later stdout chunk after the child exit is observed", () =>
     Effect.gen(function* () {
       const { stdio, input } = yield* makeInMemoryStdio();

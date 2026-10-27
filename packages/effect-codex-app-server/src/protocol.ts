@@ -229,6 +229,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
                         Effect.logWarning(
                           "Codex app-server stdout did not close after process exit; stopping the drain. Later output may be lost.",
                         ).pipe(
+                          Effect.andThen(Ref.set(drainingAfterExit, false)),
                           Effect.andThen(Deferred.succeed(stopInputSignal, undefined)),
                           Effect.asVoid,
                         ),
