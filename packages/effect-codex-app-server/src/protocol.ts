@@ -175,7 +175,9 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     const terminationHandled = yield* Ref.make(false);
     const terminationFailure = yield* Ref.make(Option.none<CodexError.CodexAppServerError>());
     const terminationSignal = yield* Deferred.make<void>();
+    const stopInputSignal = yield* Deferred.make<void>();
     const inputReaderFinished = yield* Deferred.make<void>();
+    const terminationReady = yield* Deferred.make<void>();
     const activeRequestHandlers = yield* Ref.make(0);
 
     const logProtocol = (event: CodexAppServerProtocolLogEvent) => {
@@ -213,12 +215,32 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
             yield* failAllPending(error);
             yield* Queue.end(outgoing);
             yield* Deferred.succeed(terminationSignal, undefined);
+            yield* (
+              error._tag === "CodexAppServerProcessExitedError"
+                ? Deferred.await(inputReaderFinished).pipe(
+                    Effect.timeoutOrElse({
+                      duration: "1 second",
+                      orElse: () =>
+                        Effect.logWarning(
+                          "Codex app-server stdout did not close after process exit; stopping the drain. Later output may be lost.",
+                        ).pipe(
+                          Effect.andThen(Deferred.succeed(stopInputSignal, undefined)),
+                          Effect.asVoid,
+                        ),
+                    }),
+                  )
+                : Deferred.succeed(stopInputSignal, undefined).pipe(Effect.asVoid)
+            ).pipe(
+              Effect.andThen(Deferred.succeed(terminationReady, undefined)),
+              Effect.forkIn(protocolScope),
+              Effect.asVoid,
+            );
             yield* Scope.close(requestHandlerScope, Exit.void).pipe(
               Effect.forkIn(protocolScope, { startImmediately: true }),
               Effect.asVoid,
             );
             if (options.onTermination) {
-              yield* Deferred.await(inputReaderFinished).pipe(
+              yield* Deferred.await(terminationReady).pipe(
                 Effect.andThen(options.onTermination(error)),
                 Effect.forkIn(protocolScope),
                 Effect.asVoid,
@@ -430,7 +452,7 @@ export const makeCodexAppServerPatchedProtocol = Effect.fn("makeCodexAppServerPa
     };
 
     yield* options.stdio.stdin.pipe(
-      Stream.interruptWhen(Deferred.await(terminationSignal)),
+      Stream.interruptWhen(Deferred.await(stopInputSignal)),
       Stream.decodeText(),
       Stream.runForEach(
         Effect.fnUntraced(function* (chunk) {

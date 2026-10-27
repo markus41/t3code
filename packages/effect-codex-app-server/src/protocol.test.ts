@@ -22,6 +22,56 @@ const encodeJsonl = (value: unknown) => encoder.encode(`${encodeUnknownJsonStrin
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
+  it.effect("reports termination when a notification handler does not finish", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const exit = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const entered = yield* Deferred.make<void>();
+      const terminated = yield* Deferred.make<void>();
+      yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        terminationError: Deferred.await(exit),
+        onTermination: () => Deferred.succeed(terminated, undefined).pipe(Effect.asVoid),
+        onNotification: () =>
+          Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      yield* Queue.offer(input, encodeJsonl({ method: "blocked", params: {} }));
+      yield* Deferred.await(entered);
+      yield* Deferred.succeed(exit, new CodexError.CodexAppServerProcessExitedError({ code: 7 }));
+      yield* TestClock.adjust("300 millis");
+      assert.isFalse(yield* Deferred.isDone(terminated));
+      yield* TestClock.adjust("1 second");
+      yield* Deferred.await(terminated);
+    }),
+  );
+
+  it.effect("drains a later stdout chunk after the child exit is observed", () =>
+    Effect.gen(function* () {
+      const { stdio, input } = yield* makeInMemoryStdio();
+      const exit = yield* Deferred.make<CodexError.CodexAppServerError>();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const completed = yield* Deferred.make<void>();
+      const transport = yield* CodexProtocol.makeCodexAppServerPatchedProtocol({
+        stdio,
+        terminationError: Deferred.await(exit),
+        onNotification: (notification) =>
+          notification.method === "first"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Deferred.succeed(completed, undefined).pipe(Effect.asVoid),
+      });
+      yield* Queue.offer(input, encodeJsonl({ method: "first", params: {} }));
+      yield* Deferred.await(entered);
+      yield* Deferred.succeed(exit, new CodexError.CodexAppServerProcessExitedError({ code: 7 }));
+      yield* TestClock.adjust("300 millis");
+      yield* Queue.offer(input, encodeJsonl({ method: "turn/completed", params: {} }));
+      yield* Queue.end(input);
+      yield* Deferred.succeed(release, undefined);
+      yield* Deferred.await(completed);
+      void transport;
+    }),
+  );
+
   it.effect("drains received notifications before publishing process termination", () =>
     Effect.gen(function* () {
       const { stdio, input, output } = yield* makeInMemoryStdio();
@@ -58,6 +108,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server protocol", (it) => {
       assert.isFalse(yield* Deferred.isDone(terminated));
       yield* Deferred.succeed(release, undefined);
       yield* Deferred.await(completed);
+      yield* Queue.end(input);
       yield* Deferred.await(terminated);
     }),
   );
