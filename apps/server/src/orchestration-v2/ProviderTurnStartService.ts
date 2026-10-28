@@ -917,7 +917,9 @@ export const layer: Layer.Layer<
             !resumeFellBack &&
             source.ordinal < run.ordinal &&
             source.providerThreadId === providerThread.id &&
-            (source.status === "failed" || source.status === "interrupted") &&
+            (source.status === "failed" ||
+              source.status === "interrupted" ||
+              source.status === "cancelled") &&
             !deliveredAttemptIds.has(source.activeAttemptId),
         );
         const missedRunIds = new Set(missedRuns.map((source) => source.id));

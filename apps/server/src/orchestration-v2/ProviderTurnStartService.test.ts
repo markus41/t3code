@@ -15,6 +15,8 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  TurnItemId,
+  type OrchestrationV2ContextHandoff,
   ProjectId,
   type OrchestrationV2ThreadProjection,
   OrchestrationV2DomainEvent,
@@ -677,6 +679,18 @@ function makeLocalCommandHarness(input: {
   const createWorktree = vi.fn<GitWorkflow.GitWorkflowService["Service"]["createWorktree"]>(() =>
     Effect.succeed({} as never),
   );
+  const prepareProviderHandoff = vi.fn<
+    ContextHandoffService.ContextHandoffServiceV2Shape["prepareProviderHandoff"]
+  >(() => Effect.die("history read must fail first"));
+  const getTurnStartHistory = vi.fn<ProjectionStore.ProjectionStoreV2Shape["getTurnStartHistory"]>(
+    () =>
+      Effect.fail(
+        new ProjectionStore.ProjectionStoreReadError({
+          threadId,
+          cause: input.historyReadFailureAfterFallback,
+        }),
+      ),
+  );
   const getThreadRecords = vi.fn<ProjectionStore.ProjectionStoreV2Shape["getThreadRecords"]>(() =>
     Effect.succeed(projection),
   );
@@ -694,7 +708,7 @@ function makeLocalCommandHarness(input: {
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
-          prepareProviderHandoff: () => Effect.die("history read must fail first"),
+          prepareProviderHandoff,
         }),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -727,13 +741,7 @@ function makeLocalCommandHarness(input: {
                   (m.text.trim().toLowerCase() !== "/compact" || m.attachments.length > 0),
               ),
             }),
-          getTurnStartHistory: () =>
-            Effect.fail(
-              new ProjectionStore.ProjectionStoreReadError({
-                threadId,
-                cause: input.historyReadFailureAfterFallback,
-              }),
-            ),
+          getTurnStartHistory,
         }),
         Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
           open,
@@ -757,6 +765,8 @@ function makeLocalCommandHarness(input: {
     ),
   );
   return {
+    prepareProviderHandoff,
+    getTurnStartHistory,
     getThreadRecords,
     getTurnStartContext,
     setProjection: (next: OrchestrationV2ThreadProjection) => {
@@ -946,6 +956,74 @@ effectIt.effect(
       ]);
       expect(JSON.stringify(harness.events)).not.toContain("private git diagnostic");
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
+effectIt.effect.each([false, true])(
+  "recovers only unaccepted cancelled input as history for a new turn (accepted: %s)",
+  (accepted) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({
+        text: "Okay tell me what to do",
+        previousTurn: { runStatus: "failed", turnStatus: "interrupted" },
+      });
+      const projection = harness.projection();
+      const previousRun = { ...projection.runs[0]!, status: "cancelled" as const };
+      const currentRun = projection.runs[1]!;
+      const originalRequest = "Set up the private notes repository through IaC.";
+      const historyItem: OrchestrationV2ThreadProjection["turnItems"][number] = {
+        id: TurnItemId.make("cancelled-request"),
+        threadId: projection.thread.id,
+        runId: previousRun.id,
+        nodeId: previousRun.rootNodeId,
+        providerThreadId: previousRun.providerThreadId,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        ordinal: 1,
+        type: "user_message",
+        status: "completed",
+        title: null,
+        startedAt: previousRun.requestedAt,
+        completedAt: previousRun.completedAt,
+        updatedAt: previousRun.requestedAt,
+        messageId: MessageId.make("cancelled-request"),
+        text: originalRequest,
+        createdBy: "user",
+        creationSource: "server",
+        inputIntent: "turn_start",
+        attachments: [],
+      };
+      harness.setProjection({
+        ...projection,
+        runs: [previousRun, currentRun],
+        providerTurns: accepted ? projection.providerTurns : [],
+      });
+      harness.getTurnStartHistory.mockReturnValue(Effect.succeed([historyItem]));
+      const prepared: Array<OrchestrationV2ContextHandoff> = [];
+      const handoffs = yield* ContextHandoffService.ContextHandoffServiceV2;
+      harness.prepareProviderHandoff.mockImplementation((input) =>
+        handoffs
+          .prepareProviderHandoff(input)
+          .pipe(Effect.tap((handoff) => Effect.sync(() => prepared.push(handoff)))),
+      );
+
+      yield* harness.start;
+
+      expect(prepared).toHaveLength(accepted ? 0 : 1);
+      if (!accepted) {
+        expect(prepared[0]?.history?.messages).toMatchObject([
+          { role: "user", text: originalRequest, runStatus: "cancelled" },
+        ]);
+        expect(prepared[0]?.strategy).toBe("delta_since_target_last_seen");
+        expect(prepared[0]?.summaryText).toContain(originalRequest);
+      }
+      expect(harness.projection().runs.find((run) => run.id === previousRun.id)?.status).toBe(
+        "cancelled",
+      );
+      expect(harness.startRootRun).toHaveBeenCalledTimes(1);
+      expect(harness.startRootRun.mock.calls[0]?.[0].run.id).toBe(currentRun.id);
+      expect(harness.projection().messages.at(-1)?.text).toBe("Okay tell me what to do");
+    }).pipe(Effect.provide(ContextHandoffService.layer.pipe(Layer.provide(IdAllocator.layer)))),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>
